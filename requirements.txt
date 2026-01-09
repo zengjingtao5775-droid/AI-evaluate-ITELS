@@ -1,8 +1,0 @@
-fastapi
-uvicorn
-python-multipart
-openai>=1.12.0
-python-dotenv
-qdrant-client>=1.7.0
-numpy
-httpx
