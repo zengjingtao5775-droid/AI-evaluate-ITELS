@@ -1,6 +1,8 @@
 fastapi
-python-multipart
 uvicorn
-openai
+python-multipart
+openai>=1.12.0
 python-dotenv
-qdrant-client
+qdrant-client>=1.7.3
+numpy
+httpx
