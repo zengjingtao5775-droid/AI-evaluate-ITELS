@@ -12,19 +12,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# 尝试导入 Qdrant 并检查版本
+# 2. 尝试导入 Qdrant 并获取版本号 (侦探代码)
 try:
     import qdrant_client
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, VectorParams, PointStruct
-    QDRANT_VERSION = qdrant_client.__version__
+    INSTALLED_VERSION = qdrant_client.__version__
 except ImportError:
     QdrantClient = None
-    QDRANT_VERSION = "Not Installed"
+    INSTALLED_VERSION = "NOT_INSTALLED"
 
-# 2. 初始化
+# 3. 初始化
 load_dotenv()
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -50,22 +49,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- 新增：调试接口 (Debug Endpoint) ---
+@app.get("/debug-version")
+def debug_version():
+    """
+    这个接口专门用来查案，看看 Render 到底装了哪个版本
+    """
+    return {
+        "status": "online",
+        "qdrant_version": INSTALLED_VERSION,
+        "has_search_method": hasattr(qdrant, 'search') if qdrant else False,
+        "has_search_points_method": hasattr(qdrant, 'search_points') if qdrant else False
+    }
+
 @app.on_event("startup")
 def startup_event():
-    print(f"🚀 Server Starting... Qdrant Client Version: {QDRANT_VERSION}")
+    print(f"🚀 Server Starting... Installed Qdrant Version: {INSTALLED_VERSION}")
     if qdrant:
         try:
-            if not qdrant.collection_exists(collection_name=COLLECTION_NAME):
+            # 兼容旧版本检查 collection 的方法
+            if hasattr(qdrant, 'collection_exists'):
+                exists = qdrant.collection_exists(collection_name=COLLECTION_NAME)
+            else:
+                # 极旧版本可能需要 get_collection
+                try:
+                    qdrant.get_collection(COLLECTION_NAME)
+                    exists = True
+                except:
+                    exists = False
+            
+            if not exists:
                 qdrant.create_collection(
                     collection_name=COLLECTION_NAME,
                     vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
                 )
                 print(f"Collection {COLLECTION_NAME} created.")
         except Exception as e:
-            print(f"Startup check passed or skipped: {e}")
+            print(f"Startup check warning: {e}")
 
-# --- 核心工具函数 ---
-
+# --- 工具函数 ---
 def get_embedding(text: str):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
@@ -85,35 +107,33 @@ def analyze_audio_transcript(transcript: str):
     )
     return json.loads(response.choices[0].message.content)
 
-def safe_search_teachers(query_vector, limit=3):
-    """
-    🛡️ 防崩溃搜索函数：如果版本不支持 search，则返回空列表或假数据，而不是报错 500
-    """
+# --- 🛡️ 核心修复：万能搜索函数 ---
+def safe_qdrant_search(query_vector, limit=3):
     if not qdrant:
-        print("Qdrant client is missing.")
+        print("❌ Qdrant client is missing.")
         return []
 
-    try:
-        # 尝试标准的新版 search 方法
-        if hasattr(qdrant, 'search'):
-            return qdrant.search(
-                collection_name=COLLECTION_NAME,
-                query_vector=query_vector,
-                limit=limit
-            )
-        # 尝试旧版方法 (兼容 v1.0 以前)
-        elif hasattr(qdrant, 'search_points'):
-            print("Using legacy 'search_points'...")
-            return qdrant.search_points(
-                collection_name=COLLECTION_NAME,
-                vector=query_vector,
-                limit=limit
-            )
-        else:
-            print(f"🚨 CRITICAL: Qdrant version {QDRANT_VERSION} has no known search method.")
-            return []
-    except Exception as e:
-        print(f"Search failed gracefully: {str(e)}")
+    # 1. 尝试新版 search (v1.0+)
+    if hasattr(qdrant, 'search'):
+        print(f"✅ Using standard 'search' (Version: {INSTALLED_VERSION})")
+        return qdrant.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=limit
+        )
+    
+    # 2. 尝试旧版 search_points (v0.x)
+    elif hasattr(qdrant, 'search_points'):
+        print(f"⚠️ Using legacy 'search_points' (Version: {INSTALLED_VERSION})")
+        return qdrant.search_points(
+            collection_name=COLLECTION_NAME,
+            vector=query_vector,
+            limit=limit
+        )
+    
+    # 3. 如果都不行，返回空列表，防止报错崩掉
+    else:
+        print(f"🚨 Critical: No search method found. Please update library.")
         return []
 
 @app.post("/assess-audio")
@@ -139,13 +159,13 @@ async def assess_audio(file: Union[UploadFile, str] = File(...)):
         # 2. GPT
         ai_result = analyze_audio_transcript(transcript_text)
         
-        # 3. RAG 搜索 (使用安全函数)
+        # 3. RAG 搜索 (⚠️ 关键：这里调用的是 safe_qdrant_search)
         query_vector = get_embedding(ai_result['weakness_search_query'])
-        search_result = safe_search_teachers(query_vector)
+        search_result = safe_qdrant_search(query_vector)
         
         recommended_teachers = []
         for hit in search_result:
-            # 兼容不同版本的 payload 读取方式
+            # 兼容旧版 payload 获取方式
             payload = hit.payload if hasattr(hit, 'payload') else hit.get('payload', {})
             recommended_teachers.append({
                 "bubble_id": payload.get('bubble_id'),
@@ -164,12 +184,13 @@ async def assess_audio(file: Union[UploadFile, str] = File(...)):
 
     except Exception as e:
         print(f"Error: {e}")
-        # 这里把 Qdrant 版本号一起返回，方便你在 Bubble 看到了解情况
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)} | Qdrant Ver: {QDRANT_VERSION}")
+        # 把版本号返回给 Bubble，方便我们看
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)} | Installed Qdrant Ver: {INSTALLED_VERSION}")
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
+# Admin 接口
 @app.post("/admin/add-teacher")
 async def add_teacher(name: str = Form(...), specialty_desc: str = Form(...), bubble_id: str = Form(...), secret_key: str = Header(None)):
     if secret_key != ADMIN_SECRET: raise HTTPException(status_code=401)
