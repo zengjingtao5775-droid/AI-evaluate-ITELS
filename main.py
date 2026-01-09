@@ -3,9 +3,9 @@ import json
 import shutil
 import tempfile
 import uuid
-import urllib.request 
-from typing import List, Union # 🟢 确保引入了 Union
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+import urllib.request # 用于下载 URL
+from typing import List, Union # 确保引入 Union
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header # 🟢 引入 Form
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -15,26 +15,19 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 # 1. 初始化配置
 load_dotenv() 
 
-# ⚠️ 部署时，请在 Render/Railway 的 Environment Variables 里填入这些值，不要写死在代码里
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL") 
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "123456") # 默认密码
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
-# 定义向量库集合名称
 COLLECTION_NAME = "teachers_skills"
 
 app = FastAPI(title="PandaFreeAI Engine")
 
-# 2. 配置跨域，允许你的 Bubble 域名访问
-origins = [
-    "http://pandafreeai.com",
-    "https://pandafreeai.com",
-    "http://version-test.pandafreeai.com", # Bubble 的测试环境域名通常长这样，建议加上
-    "*" # 开发阶段为了方便可以全开，上线建议限制
-]
+origins = ["*"] # 允许所有跨域，生产环境可改为你的域名
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,32 +37,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 启动时检查/创建数据库 ---
 @app.on_event("startup")
 def startup_event():
-    # 检查集合是否存在，不存在则创建
     if not qdrant.collection_exists(collection_name=COLLECTION_NAME):
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=1536, distance=Distance.COSINE), # OpenAI embedding 维度是 1536
+            vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
         )
         print(f"Collection {COLLECTION_NAME} created.")
 
-# --- 核心工具函数 ---
+# --- 工具函数 ---
 
 def get_embedding(text: str):
-    """调用 OpenAI 将文本转为向量"""
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
 
 def analyze_audio_transcript(transcript: str):
-    """GPT-4o 评分并提取弱点"""
     system_prompt = """
     You are an expert IELTS Speaking examiner. Analyze the transcript.
     Return JSON with:
     - 'overall_score': Float (0-9)
     - 'feedback': String (Constructive feedback)
-    - 'weakness_search_query': String (Describe the core problem to search for a teacher. E.g., 'Teacher specialized in correcting flat intonation and pause fillers')
+    - 'weakness_search_query': String (Describe the core problem for RAG search)
     """
     response = client.chat.completions.create(
         model="gpt-4o",
@@ -83,27 +72,24 @@ def analyze_audio_transcript(transcript: str):
 
 # --- API 接口 ---
 
-# [后台功能] 添加老师到向量库
-# 你可以用 Postman 调用这个接口，把老师数据灌进去
+# 1. 修复后的添加老师接口 (使用 Form)
 @app.post("/admin/add-teacher")
-async def add_teacher(name: str, specialty_desc: str, bubble_id: str, secret_key: str = Header(None)):
-    """
-    specialty_desc: 详细描述老师擅长什么 (这段文字会被变成向量)
-    bubble_id: Bubble 数据库里该老师的 Unique ID
-    """
-    # 简单加一个密码防止被滥用
-    if secret_key != os.getenv("ADMIN_SECRET", "123456"):
+async def add_teacher(
+    name: str = Form(...), 
+    specialty_desc: str = Form(...), 
+    bubble_id: str = Form(...), 
+    secret_key: str = Header(None)
+):
+    if secret_key != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 1. 计算向量
     vector = get_embedding(specialty_desc)
     
-    # 2. 存入 Qdrant
-    operation_info = qdrant.upsert(
+    qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=[
             PointStruct(
-                id=str(uuid.uuid4()), # 向量库内部ID
+                id=str(uuid.uuid4()),
                 vector=vector,
                 payload={
                     "bubble_id": bubble_id,
@@ -115,44 +101,41 @@ async def add_teacher(name: str, specialty_desc: str, bubble_id: str, secret_key
     )
     return {"status": "success", "teacher": name}
 
-# [前台功能] 核心业务：评测 + 推荐
-# [前台功能] 核心业务：评测 + 推荐
+# 2. 修复后的评测接口 (兼容 URL 和 文件)
 @app.post("/assess-audio")
-# 🔴 修改点 1：把 file 类型改成 Union[UploadFile, str]，表示既接受文件也接受字符串
 async def assess_audio(file: Union[UploadFile, str] = File(...)):
     
-    # 1. 创建临时文件路径
+    # 创建临时文件
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     temp_file_path = temp_file.name
-    temp_file.close() # 先关闭句柄，防止占用
+    temp_file.close()
 
     try:
-        # 🔴 修改点 2：智能判断是 URL 还是文件对象
+        # 判断是 URL 还是 文件流
         if isinstance(file, str):
-            # 情况 A：Bubble 发来的是 URL 字符串 (比如 https://...)
-            print(f"Received URL: {file}") # 方便在 Render 日志里看
-            # 自动下载这个文件到临时路径
-            # 注意：如果 URL 含有空格等特殊字符，urllib 通常能处理，但最好确保 URL 是编码过的
-            urllib.request.urlretrieve(file, temp_file_path)
+            print(f"Received URL: {file}")
+            # 伪装 Header 避免某些 CDN 拒绝 python-urllib 请求 (可选，但推荐)
+            req = urllib.request.Request(
+                file, 
+                data=None, 
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req) as response, open(temp_file_path, 'wb') as out_file:
+                shutil.copyfileobj(response, out_file)
         else:
-            # 情况 B：Bubble 发来的是二进制文件 (UploadFile)
             print("Received Binary File")
             with open(temp_file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-        # --- 以下逻辑保持不变 ---
-        
-        # 2. Whisper 转录
+        # 正常业务逻辑
         with open(temp_file_path, "rb") as audio:
             transcription = client.audio.transcriptions.create(
                 model="whisper-1", file=audio
             )
         transcript_text = transcription.text
 
-        # 3. GPT-4o 诊断
         ai_result = analyze_audio_transcript(transcript_text)
         
-        # 4. Qdrant 向量搜索
         query_vector = get_embedding(ai_result['weakness_search_query'])
         search_result = qdrant.search(
             collection_name=COLLECTION_NAME,
@@ -177,11 +160,9 @@ async def assess_audio(file: Union[UploadFile, str] = File(...)):
         }
 
     except Exception as e:
-        # 打印详细错误方便调试
         print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
     finally:
-        # 清理临时文件
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
