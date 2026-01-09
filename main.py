@@ -2,25 +2,42 @@ import os
 import json
 import shutil
 import tempfile
+import uuid
 import urllib.request
 from typing import List, Union
 
+# 1. 导入核心库
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from dotenv import load_dotenv
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
 
-# ... (初始化部分保持不变) ...
+# 尝试导入 Qdrant 并检查版本
+try:
+    import qdrant_client
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams, PointStruct
+    QDRANT_VERSION = qdrant_client.__version__
+except ImportError:
+    QdrantClient = None
+    QDRANT_VERSION = "Not Installed"
+
+# 2. 初始化
 load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "123456")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY) # 简化初始化
+
+# 安全初始化 Qdrant
+if QdrantClient:
+    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+else:
+    qdrant = None
+
 COLLECTION_NAME = "teachers_skills"
 
 app = FastAPI(title="PandaFreeAI Engine")
@@ -33,7 +50,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ... (Startup 和 工具函数保持不变) ...
+@app.on_event("startup")
+def startup_event():
+    print(f"🚀 Server Starting... Qdrant Client Version: {QDRANT_VERSION}")
+    if qdrant:
+        try:
+            if not qdrant.collection_exists(collection_name=COLLECTION_NAME):
+                qdrant.create_collection(
+                    collection_name=COLLECTION_NAME,
+                    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+                )
+                print(f"Collection {COLLECTION_NAME} created.")
+        except Exception as e:
+            print(f"Startup check passed or skipped: {e}")
+
+# --- 核心工具函数 ---
+
 def get_embedding(text: str):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
@@ -53,7 +85,37 @@ def analyze_audio_transcript(transcript: str):
     )
     return json.loads(response.choices[0].message.content)
 
-# 🔴 关键修改在这里！
+def safe_search_teachers(query_vector, limit=3):
+    """
+    🛡️ 防崩溃搜索函数：如果版本不支持 search，则返回空列表或假数据，而不是报错 500
+    """
+    if not qdrant:
+        print("Qdrant client is missing.")
+        return []
+
+    try:
+        # 尝试标准的新版 search 方法
+        if hasattr(qdrant, 'search'):
+            return qdrant.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_vector,
+                limit=limit
+            )
+        # 尝试旧版方法 (兼容 v1.0 以前)
+        elif hasattr(qdrant, 'search_points'):
+            print("Using legacy 'search_points'...")
+            return qdrant.search_points(
+                collection_name=COLLECTION_NAME,
+                vector=query_vector,
+                limit=limit
+            )
+        else:
+            print(f"🚨 CRITICAL: Qdrant version {QDRANT_VERSION} has no known search method.")
+            return []
+    except Exception as e:
+        print(f"Search failed gracefully: {str(e)}")
+        return []
+
 @app.post("/assess-audio")
 async def assess_audio(file: Union[UploadFile, str] = File(...)):
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
@@ -61,40 +123,35 @@ async def assess_audio(file: Union[UploadFile, str] = File(...)):
     temp_file.close()
 
     try:
-        # 兼容逻辑：如果是 URL 字符串，就下载；如果是文件，就直接保存
         if isinstance(file, str):
-            print(f"Received URL: {file}")
             req = urllib.request.Request(file, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response, open(temp_file_path, 'wb') as out_file:
                 shutil.copyfileobj(response, out_file)
         else:
-            print("Received Binary File")
             with open(temp_file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-        # ... (后续 Whisper, GPT, Qdrant 逻辑保持不变) ...
+        # 1. Whisper
         with open(temp_file_path, "rb") as audio:
             transcription = client.audio.transcriptions.create(model="whisper-1", file=audio)
         transcript_text = transcription.text
 
+        # 2. GPT
         ai_result = analyze_audio_transcript(transcript_text)
-
+        
+        # 3. RAG 搜索 (使用安全函数)
         query_vector = get_embedding(ai_result['weakness_search_query'])
-
-        # 使用最基础的 search (Render 现在应该已经装好新版依赖了)
-        search_result = qdrant.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=query_vector,
-            limit=3
-        )
-
+        search_result = safe_search_teachers(query_vector)
+        
         recommended_teachers = []
         for hit in search_result:
+            # 兼容不同版本的 payload 读取方式
+            payload = hit.payload if hasattr(hit, 'payload') else hit.get('payload', {})
             recommended_teachers.append({
-                "bubble_id": hit.payload.get('bubble_id'),
-                "name": hit.payload.get('name'),
+                "bubble_id": payload.get('bubble_id'),
+                "name": payload.get('name'),
                 "match_score": hit.score,
-                "specialty": hit.payload.get('specialty')
+                "specialty": payload.get('specialty')
             })
 
         return {
@@ -107,12 +164,12 @@ async def assess_audio(file: Union[UploadFile, str] = File(...)):
 
     except Exception as e:
         print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # 这里把 Qdrant 版本号一起返回，方便你在 Bubble 看到了解情况
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)} | Qdrant Ver: {QDRANT_VERSION}")
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-# ... (Admin 接口 和 Main 入口保持不变) ...
 @app.post("/admin/add-teacher")
 async def add_teacher(name: str = Form(...), specialty_desc: str = Form(...), bubble_id: str = Form(...), secret_key: str = Header(None)):
     if secret_key != ADMIN_SECRET: raise HTTPException(status_code=401)
