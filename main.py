@@ -6,24 +6,16 @@ import uuid
 import urllib.request
 from typing import List, Union
 
-# 1. 导入核心库
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
 
-# 2. 尝试导入 Qdrant 并获取版本号 (侦探代码)
-try:
-    import qdrant_client
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import Distance, VectorParams, PointStruct
-    INSTALLED_VERSION = qdrant_client.__version__
-except ImportError:
-    QdrantClient = None
-    INSTALLED_VERSION = "NOT_INSTALLED"
-
-# 3. 初始化
+# --- 1. 初始化 ---
 load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -31,11 +23,15 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "123456")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# 安全初始化 Qdrant
-if QdrantClient:
+# 尝试连接 Qdrant (包裹在 try-except 中以防崩坏)
+qdrant = None
+try:
+    print(f"Connecting to Qdrant...")
     qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-else:
-    qdrant = None
+    # 简单的连接测试
+    print("Qdrant Client initialized.")
+except Exception as e:
+    print(f"⚠️ Warning: Qdrant connection failed: {e}")
 
 COLLECTION_NAME = "teachers_skills"
 
@@ -49,45 +45,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 新增：调试接口 (Debug Endpoint) ---
-@app.get("/debug-version")
-def debug_version():
-    """
-    这个接口专门用来查案，看看 Render 到底装了哪个版本
-    """
-    return {
-        "status": "online",
-        "qdrant_version": INSTALLED_VERSION,
-        "has_search_method": hasattr(qdrant, 'search') if qdrant else False,
-        "has_search_points_method": hasattr(qdrant, 'search_points') if qdrant else False
-    }
+# --- 2. 工具函数 ---
 
-@app.on_event("startup")
-def startup_event():
-    print(f"🚀 Server Starting... Installed Qdrant Version: {INSTALLED_VERSION}")
-    if qdrant:
-        try:
-            # 兼容旧版本检查 collection 的方法
-            if hasattr(qdrant, 'collection_exists'):
-                exists = qdrant.collection_exists(collection_name=COLLECTION_NAME)
-            else:
-                # 极旧版本可能需要 get_collection
-                try:
-                    qdrant.get_collection(COLLECTION_NAME)
-                    exists = True
-                except:
-                    exists = False
-            
-            if not exists:
-                qdrant.create_collection(
-                    collection_name=COLLECTION_NAME,
-                    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
-                )
-                print(f"Collection {COLLECTION_NAME} created.")
-        except Exception as e:
-            print(f"Startup check warning: {e}")
-
-# --- 工具函数 ---
 def get_embedding(text: str):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
@@ -107,34 +66,7 @@ def analyze_audio_transcript(transcript: str):
     )
     return json.loads(response.choices[0].message.content)
 
-# --- 🛡️ 核心修复：万能搜索函数 ---
-def safe_qdrant_search(query_vector, limit=3):
-    if not qdrant:
-        print("❌ Qdrant client is missing.")
-        return []
-
-    # 1. 尝试新版 search (v1.0+)
-    if hasattr(qdrant, 'search'):
-        print(f"✅ Using standard 'search' (Version: {INSTALLED_VERSION})")
-        return qdrant.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=query_vector,
-            limit=limit
-        )
-    
-    # 2. 尝试旧版 search_points (v0.x)
-    elif hasattr(qdrant, 'search_points'):
-        print(f"⚠️ Using legacy 'search_points' (Version: {INSTALLED_VERSION})")
-        return qdrant.search_points(
-            collection_name=COLLECTION_NAME,
-            vector=query_vector,
-            limit=limit
-        )
-    
-    # 3. 如果都不行，返回空列表，防止报错崩掉
-    else:
-        print(f"🚨 Critical: No search method found. Please update library.")
-        return []
+# --- 3. 核心接口 ---
 
 @app.post("/assess-audio")
 async def assess_audio(file: Union[UploadFile, str] = File(...)):
@@ -143,36 +75,53 @@ async def assess_audio(file: Union[UploadFile, str] = File(...)):
     temp_file.close()
 
     try:
+        # 1. 下载或保存文件
         if isinstance(file, str):
+            print(f"Downloading URL: {file}")
             req = urllib.request.Request(file, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response, open(temp_file_path, 'wb') as out_file:
                 shutil.copyfileobj(response, out_file)
         else:
+            print("Saving uploaded file")
             with open(temp_file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-        # 1. Whisper
+        # 2. Whisper 转录
         with open(temp_file_path, "rb") as audio:
             transcription = client.audio.transcriptions.create(model="whisper-1", file=audio)
         transcript_text = transcription.text
 
-        # 2. GPT
+        # 3. GPT-4o 评分
         ai_result = analyze_audio_transcript(transcript_text)
         
-        # 3. RAG 搜索 (⚠️ 关键：这里调用的是 safe_qdrant_search)
-        query_vector = get_embedding(ai_result['weakness_search_query'])
-        search_result = safe_qdrant_search(query_vector)
-        
+        # 4. Qdrant 向量搜索
         recommended_teachers = []
-        for hit in search_result:
-            # 兼容旧版 payload 获取方式
-            payload = hit.payload if hasattr(hit, 'payload') else hit.get('payload', {})
-            recommended_teachers.append({
-                "bubble_id": payload.get('bubble_id'),
-                "name": payload.get('name'),
-                "match_score": hit.score,
-                "specialty": payload.get('specialty')
-            })
+        if qdrant:
+            try:
+                print("Searching Qdrant for teachers...")
+                query_vector = get_embedding(ai_result['weakness_search_query'])
+                
+                # 直接搜索
+                search_result = qdrant.search(
+                    collection_name=COLLECTION_NAME,
+                    query_vector=query_vector,
+                    limit=3
+                )
+                
+                for hit in search_result:
+                    payload = hit.payload or {}
+                    recommended_teachers.append({
+                        "bubble_id": payload.get('bubble_id'),
+                        "name": payload.get('name'),
+                        "match_score": hit.score,
+                        "specialty": payload.get('specialty')
+                    })
+            except Exception as e:
+                print(f"Search error: {e}")
+                # 搜索出错也不要崩，返回空列表
+                recommended_teachers = []
+        else:
+            print("Qdrant not connected, skipping search.")
 
         return {
             "status": "success",
@@ -184,20 +133,33 @@ async def assess_audio(file: Union[UploadFile, str] = File(...)):
 
     except Exception as e:
         print(f"Error: {e}")
-        # 把版本号返回给 Bubble，方便我们看
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)} | Installed Qdrant Ver: {INSTALLED_VERSION}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-# Admin 接口
+# --- 4. 添加老师接口 ---
 @app.post("/admin/add-teacher")
 async def add_teacher(name: str = Form(...), specialty_desc: str = Form(...), bubble_id: str = Form(...), secret_key: str = Header(None)):
     if secret_key != ADMIN_SECRET: raise HTTPException(status_code=401)
+    
+    if not qdrant:
+        raise HTTPException(status_code=500, detail="Qdrant not connected")
+
     vector = get_embedding(specialty_desc)
-    point = PointStruct(id=str(uuid.uuid4()), vector=vector, payload={"bubble_id": bubble_id, "name": name, "specialty": specialty_desc})
+    
+    point = PointStruct(
+        id=str(uuid.uuid4()), 
+        vector=vector, 
+        payload={
+            "bubble_id": bubble_id, 
+            "name": name, 
+            "specialty": specialty_desc
+        }
+    )
+    
     qdrant.upsert(collection_name=COLLECTION_NAME, points=[point])
-    return {"status": "success"}
+    return {"status": "success", "message": f"Teacher {name} added."}
 
 if __name__ == "__main__":
     import uvicorn
