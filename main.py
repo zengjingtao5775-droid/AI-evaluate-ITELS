@@ -51,11 +51,23 @@ def get_embedding(text: str):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
 
-def analyze_audio_transcript(transcript: str):
-    system_prompt = """
-    You are an expert IELTS Speaking examiner. Analyze the transcript.
-    Return JSON with: 'overall_score', 'feedback', 'weakness_search_query'.
+# 1. 修改分析函数，增加 question 参数
+def analyze_audio_transcript(transcript: str, question: str):
+    # 在 Prompt 中明确告诉 AI 题目是什么
+    system_prompt = f"""
+    You are an expert IELTS Speaking examiner. 
+    The student is answering the following question: "{question}"
+    
+    Analyze the transcript based on:
+    1. Fluency and Coherence
+    2. Lexical Resource
+    3. Grammatical Range and Accuracy
+    4. Pronunciation
+    5. Task Response (Did they answer the specific question?)
+
+    Return JSON with: 'overall_score', 'feedback', 'improvement_suggestions', 'weakness_search_query'.
     """
+    
     response = client.chat.completions.create(
         model="gpt-4o",
         response_format={"type": "json_object"},
@@ -65,34 +77,29 @@ def analyze_audio_transcript(transcript: str):
         ]
     )
     return json.loads(response.choices[0].message.content)
-
+    
 # --- 3. 核心接口 ---
 
 @app.post("/assess-audio")
-async def assess_audio(file: Union[UploadFile, str] = File(...)):
+async def assess_audio(
+    file: Union[UploadFile, str] = File(...), 
+    question_text: str = Form(...)  # <--- 新增这一行：接收前端传来的题目
+):
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     temp_file_path = temp_file.name
     temp_file.close()
 
     try:
-        # 1. 下载或保存文件
-        if isinstance(file, str):
-            print(f"Downloading URL: {file}")
-            req = urllib.request.Request(file, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response, open(temp_file_path, 'wb') as out_file:
-                shutil.copyfileobj(response, out_file)
-        else:
-            print("Saving uploaded file")
-            with open(temp_file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+        # ... (保存文件的代码不变) ...
 
-        # 2. Whisper 转录
+        # Whisper 转录 (不变)
         with open(temp_file_path, "rb") as audio:
             transcription = client.audio.transcriptions.create(model="whisper-1", file=audio)
         transcript_text = transcription.text
 
-        # 3. GPT-4o 评分
-        ai_result = analyze_audio_transcript(transcript_text)
+        # 3. 调用分析函数时，把题目传进去
+        print(f"Analyzing answer for question: {question_text}")
+        ai_result = analyze_audio_transcript(transcript_text, question_text)
         
         # 4. Qdrant 向量搜索
         recommended_teachers = []
