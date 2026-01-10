@@ -133,8 +133,13 @@ async def assess_audio(
         return {
             "status": "success",
             "transcript": transcript_text,
-            "score": ai_result['overall_score'],
-            "feedback": ai_result['feedback'],
+            
+            # 直接把 GPT 返回的字段拆包返回，或者手动指定
+            "overall_score": ai_result.get('overall_score'),
+            "short_evaluation": ai_result.get('short_evaluation'),
+            "detailed_feedback": ai_result.get('detailed_feedback'),
+            "improvement_suggestions": ai_result.get('improvement_suggestions'),
+            
             "recommendations": recommended_teachers
         }
 
