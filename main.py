@@ -92,13 +92,21 @@ async def assess_audio(
     try:
         # 2. 【核心修复】判断文件来源是“上传”还是“链接”
         if isinstance(file, str):
-            # 情况 A: Bubble 传过来的是 URL 字符串 (最常见)
+            # 情况 A: Bubble 传过来的是 URL 字符串
             print(f"📥 Downloading file from URL: {file[:50]}...")
-            urllib.request.urlretrieve(file, temp_filename)
+            
+            # ⬇️⬇️⬇️ 修改开始：伪装成浏览器下载 ⬇️⬇️⬇️
+            req = urllib.request.Request(
+                file, 
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            )
+            with urllib.request.urlopen(req) as response, open(temp_filename, 'wb') as out_file:
+                shutil.copyfileobj(response, out_file)
+            # ⬆️⬆️⬆️ 修改结束 ⬆️⬆️⬆️
+            
         else:
-            # 情况 B: Bubble 传过来的是二进制文件对象
+            # 情况 B: Bubble 传过来的是二进制文件对象 (这部分保持不变)
             print(f"📥 Receiving binary file: {file.filename}")
-            # 如果原始文件有后缀，尽量保留原始后缀
             if file.filename and "." in file.filename:
                 ext = file.filename.split(".")[-1]
                 temp_filename = f"temp_{uuid.uuid4()}.{ext}"
