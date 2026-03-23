@@ -4,38 +4,43 @@ import shutil
 import tempfile
 import uuid
 import urllib.request
+import requests
 from typing import List, Union
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client import QdrantClient, models
+from zhipuai import ZhipuAI
 
-# --- 1. 初始化 ---
+# ================= 1. 配置与初始化 =================
 load_dotenv()
 
+# --- OpenAI & 雅思配置 ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "123456")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
+COLLECTION_NAME_IELTS = "teachers_skills" # 雅思搜索用的旧表
 
-# 尝试连接 Qdrant (包裹在 try-except 中以防崩坏)
+# --- 智谱AI & 老师配置 (保留你原来的硬编码配置) ---
+ZHIPU_API_KEY = "1d2423311eb947bab8f94d3c93c2c3f4.6tKAtiorGYhY7zxh"
+QDRANT_URL = "https://fbe88bb7-d113-491f-a57c-0d13aeb30fdb.us-east4-0.gcp.cloud.qdrant.io"
+QDRANT_API_KEY_ZHIPU = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.AZl1rnrCRxr8VUOYlf4-PXnxjVJbDtrm_fFYa6D-0kE"
+COLLECTION_NAME_ZHIPU = "tutors_zhipu_v1" # 智谱老师表
+
+zhipu_client = ZhipuAI(api_key=ZHIPU_API_KEY)
+
+# --- Qdrant 客户端 ---
 qdrant = None
 try:
     print(f"Connecting to Qdrant...")
-    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-    # 简单的连接测试
+    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY_ZHIPU)
     print("Qdrant Client initialized.")
 except Exception as e:
     print(f"⚠️ Warning: Qdrant connection failed: {e}")
 
-COLLECTION_NAME = "teachers_skills"
-
-app = FastAPI(title="PandaFreeAI Engine")
+app = FastAPI(title="PandaFreeAI Engine (Unified)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,15 +50,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 2. 工具函数 ---
+# ================= 2. 数据模型 =================
+class TutorSyncRequest(BaseModel):
+    bubble_id: str
+    name: str
+    price: float
+    tags: List[str]
+    description: str
 
-def get_embedding(text: str):
+class MatchRequest(BaseModel):
+    user_tags: List[str]
+    max_price: float
+
+# ================= 3. 辅助函数 =================
+
+# --- OpenAI 相关函数 ---
+def get_openai_embedding(text: str):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
 
-# 1. 修改分析函数，增加 question 参数
 def analyze_audio_transcript(transcript: str, question: str):
-    # 在 Prompt 中明确告诉 AI 题目是什么
     system_prompt = f"""
     You are an expert IELTS Speaking examiner. 
     The student is answering the following question: "{question}"
@@ -63,91 +79,82 @@ def analyze_audio_transcript(transcript: str, question: str):
     2. Lexical Resource
     3. Grammatical Range and Accuracy
     4. Pronunciation
-    5. Task Response (Did they answer the specific question?)
+    5. Task Response
 
-    Return JSON with: 'overall_score', 'feedback', 'improvement_suggestions', 'weakness_search_query'.
+    Return JSON with: 'overall_score', 'short_evaluation', 'detailed_feedback', 'improvement_suggestions', 'weakness_search_query'.
     """
-    
     response = client.chat.completions.create(
         model="gpt-4o",
         response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcript}
-        ]
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": transcript}]
     )
     return json.loads(response.choices[0].message.content)
-    
-# --- 3. 核心接口 ---
 
-@app.post("/assess-audio")
-async def assess_audio(
-    # 注意：这里类型提示允许 UploadFile 或 str
-    file: Union[UploadFile, str] = File(...), 
-    question_text: str = Form(...)
-):
-    # 1. 定义临时文件路径 (默认使用 webm，兼容性最好)
-    temp_filename = f"temp_{uuid.uuid4()}.webm"
-    
+# --- 智谱相关函数 ---
+def get_deterministic_uuid(bubble_id: str) -> str:
+    NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
+    return str(uuid.uuid5(NAMESPACE, bubble_id))
+
+def get_zhipu_embedding(text: str) -> List[float]:
+    response = zhipu_client.embeddings.create(model="embedding-2", input=text)
+    return response.data[0].embedding
+
+# ================= 4. 启动事件 =================
+@app.on_event("startup")
+def startup_event():
+    """启动时检查并创建智谱的老师向量表"""
     try:
-        # 2. 【核心修复】判断文件来源是“上传”还是“链接”
-        if isinstance(file, str):
-            # 情况 A: Bubble 传过来的是 URL 字符串
-            print(f"📥 Downloading file from URL: {file[:50]}...")
-            
-            # ⬇️⬇️⬇️ 修改开始：伪装成浏览器下载 ⬇️⬇️⬇️
-            req = urllib.request.Request(
-                file, 
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        if qdrant and not qdrant.collection_exists(COLLECTION_NAME_ZHIPU):
+            print(f"正在创建集合: {COLLECTION_NAME_ZHIPU} ...")
+            qdrant.recreate_collection(
+                collection_name=COLLECTION_NAME_ZHIPU,
+                vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
             )
+            qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "price", models.PayloadSchemaType.INTEGER)
+            qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "bubble_id", models.PayloadSchemaType.KEYWORD)
+            print("✅ 数据库初始化完成！")
+        else:
+            print("✅ 数据库已存在，准备就绪。")
+    except Exception as e:
+        print(f"初始化警告 (可忽略): {e}")
+
+# ================= 5. 核心接口 =================
+
+# 🎯 接口 1: 雅思语音评测 (OpenAI)
+@app.post("/assess-audio")
+async def assess_audio(file: Union[UploadFile, str] = File(...), question_text: str = Form(...)):
+    temp_filename = f"temp_{uuid.uuid4()}.webm"
+    try:
+        if isinstance(file, str):
+            req = urllib.request.Request(file, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response, open(temp_filename, 'wb') as out_file:
                 shutil.copyfileobj(response, out_file)
-            # ⬆️⬆️⬆️ 修改结束 ⬆️⬆️⬆️
-            
         else:
-            # 情况 B: Bubble 传过来的是二进制文件对象 (这部分保持不变)
-            print(f"📥 Receiving binary file: {file.filename}")
             if file.filename and "." in file.filename:
-                ext = file.filename.split(".")[-1]
-                temp_filename = f"temp_{uuid.uuid4()}.{ext}"
-            
+                temp_filename = f"temp_{uuid.uuid4()}.{file.filename.split('.')[-1]}"
             content = await file.read()
             with open(temp_filename, "wb") as f:
                 f.write(content)
 
-        # 检查文件大小，防止空文件报错
-        if os.path.getsize(temp_filename) == 0:
-            raise Exception("Received file is empty (0 bytes).")
+        if os.path.getsize(temp_filename) == 0: raise Exception("Received file is empty.")
 
-        # 3. Whisper 转录 (OpenAI)
-        print("🎙️ Sending to Whisper...")
         with open(temp_filename, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                model="whisper-1", 
-                file=audio_file
-            )
+            transcription = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
         transcript_text = transcription.text
-        print(f"📝 Transcript: {transcript_text[:50]}...")
 
-        # 4. 调用分析函数 (GPT-4o)
-        print(f"🧠 Analyzing answer for: {question_text}")
         ai_result = analyze_audio_transcript(transcript_text, question_text)
         
-        # 5. Qdrant 向量搜索 (搜索老师)
+        # 搜索老师 (使用 OpenAI 向量搜索旧表)
         recommended_teachers = []
         if qdrant:
             try:
-                # 只有当 AI 成功返回了 weakness_search_query 才去搜
                 search_query = ai_result.get('weakness_search_query', 'IELTS speaking teacher')
-                print(f"🔍 Searching teachers for: {search_query}")
-                
-                query_vector = get_embedding(search_query)
+                query_vector = get_openai_embedding(search_query)
                 search_result = qdrant.search(
-                    collection_name=COLLECTION_NAME,
+                    collection_name=COLLECTION_NAME_IELTS,
                     query_vector=query_vector,
                     limit=3
                 )
-                
                 for hit in search_result:
                     payload = hit.payload or {}
                     recommended_teachers.append({
@@ -158,10 +165,7 @@ async def assess_audio(
                     })
             except Exception as e:
                 print(f"⚠️ Search warning: {e}")
-                # 搜索出错不影响主流程，给个空列表
-                recommended_teachers = []
 
-        # 6. 返回结果
         return {
             "status": "success",
             "transcript": transcript_text,
@@ -171,39 +175,64 @@ async def assess_audio(
             "improvement_suggestions": ai_result.get('improvement_suggestions'),
             "recommendations": recommended_teachers
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+    finally:
+        if os.path.exists(temp_filename): os.remove(temp_filename)
+
+# 🎯 接口 2: 同步外教数据 (智谱AI)
+@app.post("/sync_tutor")
+def sync_tutor(tutor: TutorSyncRequest):
+    try:
+        text_to_embed = f"{tutor.name}。擅长：{' '.join(tutor.tags)}。简介：{tutor.description}"
+        vector = get_zhipu_embedding(text_to_embed)
+        
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME_ZHIPU,
+            points=[
+                models.PointStruct(
+                    id=get_deterministic_uuid(tutor.bubble_id),
+                    vector=vector,
+                    payload={
+                        "bubble_id": tutor.bubble_id, "name": tutor.name,
+                        "price": int(tutor.price), "tags": tutor.tags, "full_info": text_to_embed
+                    }
+                )
+            ]
+        )
+        return {"status": "success", "msg": f"老师 {tutor.name} 已同步"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 🎯 接口 3: 智能匹配老师 (智谱AI)
+@app.post("/recommend")
+def recommend(req: MatchRequest):
+    try:
+        query_text = f"寻找老师，需求：{' '.join(req.user_tags)}"
+        query_vector = get_zhipu_embedding(query_text)
+        
+        search_url = f"{QDRANT_URL}/collections/{COLLECTION_NAME_ZHIPU}/points/search"
+        search_payload = {
+            "vector": query_vector, "limit": 3, "with_payload": True,
+            "filter": {"must": [{"key": "price", "range": {"lte": int(req.max_price)}}]}
+        }
+        res = requests.post(search_url, headers={"api-key": QDRANT_API_KEY_ZHIPU}, json=search_payload)
+        search_result = res.json().get("result", [])
+        
+        if not search_result: return []
+
+        context_list = [f"- ID: {hit['payload']['bubble_id']}, 姓名: {hit['payload']['name']}, 资料: {hit['payload']['full_info']}" for hit in search_result]
+        
+        prompt = f"""你是一个课程顾问。请根据用户需求和以下候选人资料，推荐这几位老师。
+        用户需求：{req.user_tags} \n候选人列表：\n{chr(10).join(context_list)}
+        请务必只返回一个纯JSON数组：[{{"bubble_id": "...", "reason": "30字以内的推荐理由"}}]"""
+
+        response = zhipu_client.chat.completions.create(model="glm-4-flash", messages=[{"role": "user", "content": prompt}], temperature=0.7)
+        content = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+        return json.loads(content)
 
     except Exception as e:
-        print(f"❌ Error in assess_audio: {str(e)}")
-        # 打印详细错误方便调试
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
-        
-    finally:
-        # 清理垃圾文件
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-
-# --- 4. 添加老师接口 ---
-@app.post("/admin/add-teacher")
-async def add_teacher(name: str = Form(...), specialty_desc: str = Form(...), bubble_id: str = Form(...), secret_key: str = Header(None)):
-    if secret_key != ADMIN_SECRET: raise HTTPException(status_code=401)
-    
-    if not qdrant:
-        raise HTTPException(status_code=500, detail="Qdrant not connected")
-
-    vector = get_embedding(specialty_desc)
-    
-    point = PointStruct(
-        id=str(uuid.uuid4()), 
-        vector=vector, 
-        payload={
-            "bubble_id": bubble_id, 
-            "name": name, 
-            "specialty": specialty_desc
-        }
-    )
-    
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=[point])
-    return {"status": "success", "message": f"Teacher {name} added."}
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
