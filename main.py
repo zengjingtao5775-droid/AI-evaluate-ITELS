@@ -17,21 +17,17 @@ from zhipuai import ZhipuAI
 # ================= 1. 配置与初始化 =================
 load_dotenv()
 
-# 🌟 核心修复：彻底抛弃硬编码，全部读取 Render 环境变量里的活链接 🌟
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# --- OpenAI & 雅思配置 ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 COLLECTION_NAME_IELTS = "teachers_skills" 
 
-# --- 智谱AI & 老师配置 ---
 ZHIPU_API_KEY = "1d2423311eb947bab8f94d3c93c2c3f4.6tKAtiorGYhY7zxh"
 COLLECTION_NAME_ZHIPU = "tutors_zhipu_v1" 
 zhipu_client = ZhipuAI(api_key=ZHIPU_API_KEY)
 
-# --- 唯一的 Qdrant 客户端 ---
 qdrant = None
 try:
     print(f"Connecting to Qdrant at {QDRANT_URL}...")
@@ -96,26 +92,25 @@ def get_zhipu_embedding(text: str) -> List[float]:
     response = zhipu_client.embeddings.create(model="embedding-2", input=text)
     return response.data[0].embedding
 
-# ================= 4. 启动事件 =================
+# ================= 4. 启动事件 (已修复兼容性) =================
 @app.on_event("startup")
 def startup_event():
-    """启动时检查并自动创建所需的两张表"""
+    """启动时检查并自动创建所需的两张表（兼容所有 Qdrant 版本）"""
     if not qdrant:
         return
-
     try:
-        # 1. 检查并创建雅思老师表 (OpenAI, 1536维度)
-        if not qdrant.collection_exists(COLLECTION_NAME_IELTS):
+        # 获取现有的所有表名
+        existing_collections = [c.name for c in qdrant.get_collections().collections]
+
+        if COLLECTION_NAME_IELTS not in existing_collections:
             print(f"正在创建雅思新表: {COLLECTION_NAME_IELTS} ...")
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_IELTS,
                 vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
             )
             qdrant.create_payload_index(COLLECTION_NAME_IELTS, "bubble_id", models.PayloadSchemaType.KEYWORD)
-            print(f"✅ {COLLECTION_NAME_IELTS} 初始化完成！")
 
-        # 2. 检查并创建智谱老师表 (GLM, 1024维度)
-        if not qdrant.collection_exists(COLLECTION_NAME_ZHIPU):
+        if COLLECTION_NAME_ZHIPU not in existing_collections:
             print(f"正在创建智谱新表: {COLLECTION_NAME_ZHIPU} ...")
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_ZHIPU,
@@ -123,7 +118,6 @@ def startup_event():
             )
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "price", models.PayloadSchemaType.INTEGER)
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "bubble_id", models.PayloadSchemaType.KEYWORD)
-            print(f"✅ {COLLECTION_NAME_ZHIPU} 初始化完成！")
 
     except Exception as e:
         print(f"初始化数据库表失败: {e}")
@@ -245,17 +239,19 @@ def recommend(req: MatchRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-# ================= 6. 强制建表专属通道 =================
+
+# ================= 6. 强制建表专属通道 (已修复兼容性) =================
 @app.get("/init-db")
 def init_database():
     """在浏览器访问这个地址，强制初始化两张表"""
     if not qdrant:
-        return {"error": "Qdrant 客户端未连接，请检查 Render 环境变量的 URL 和 API Key"}
+        return {"error": "Qdrant 客户端未连接，请检查环境变量"}
     
     results = []
     try:
-        # 1. 建雅思表 (1536维度)
-        if not qdrant.collection_exists(COLLECTION_NAME_IELTS):
+        existing_collections = [c.name for c in qdrant.get_collections().collections]
+
+        if COLLECTION_NAME_IELTS not in existing_collections:
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_IELTS,
                 vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
@@ -265,8 +261,7 @@ def init_database():
         else:
             results.append(f"⚡ 雅思表 {COLLECTION_NAME_IELTS} 已经存在了。")
 
-        # 2. 建智谱老师表 (1024维度)
-        if not qdrant.collection_exists(COLLECTION_NAME_ZHIPU):
+        if COLLECTION_NAME_ZHIPU not in existing_collections:
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_ZHIPU,
                 vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
