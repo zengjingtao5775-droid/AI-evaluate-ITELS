@@ -4,7 +4,6 @@ import shutil
 import tempfile
 import uuid
 import urllib.request
-import requests
 from typing import List, Union
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
@@ -18,24 +17,25 @@ from zhipuai import ZhipuAI
 # ================= 1. 配置与初始化 =================
 load_dotenv()
 
+# 🌟 核心修复：彻底抛弃硬编码，全部读取 Render 环境变量里的活链接 🌟
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
 # --- OpenAI & 雅思配置 ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
-COLLECTION_NAME_IELTS = "teachers_skills" # 雅思搜索用的旧表
+COLLECTION_NAME_IELTS = "teachers_skills" 
 
-# --- 智谱AI & 老师配置 (保留你原来的硬编码配置) ---
+# --- 智谱AI & 老师配置 ---
 ZHIPU_API_KEY = "1d2423311eb947bab8f94d3c93c2c3f4.6tKAtiorGYhY7zxh"
-QDRANT_URL = "https://fbe88bb7-d113-491f-a57c-0d13aeb30fdb.us-east4-0.gcp.cloud.qdrant.io"
-QDRANT_API_KEY_ZHIPU = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.AZl1rnrCRxr8VUOYlf4-PXnxjVJbDtrm_fFYa6D-0kE"
-COLLECTION_NAME_ZHIPU = "tutors_zhipu_v1" # 智谱老师表
-
+COLLECTION_NAME_ZHIPU = "tutors_zhipu_v1" 
 zhipu_client = ZhipuAI(api_key=ZHIPU_API_KEY)
 
-# --- Qdrant 客户端 ---
+# --- 唯一的 Qdrant 客户端 ---
 qdrant = None
 try:
-    print(f"Connecting to Qdrant...")
-    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY_ZHIPU)
+    print(f"Connecting to Qdrant at {QDRANT_URL}...")
+    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     print("Qdrant Client initialized.")
 except Exception as e:
     print(f"⚠️ Warning: Qdrant connection failed: {e}")
@@ -63,8 +63,6 @@ class MatchRequest(BaseModel):
     max_price: float
 
 # ================= 3. 辅助函数 =================
-
-# --- OpenAI 相关函数 ---
 def get_openai_embedding(text: str):
     text = text.replace("\n", " ")
     return client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
@@ -90,7 +88,6 @@ def analyze_audio_transcript(transcript: str, question: str):
     )
     return json.loads(response.choices[0].message.content)
 
-# --- 智谱相关函数 ---
 def get_deterministic_uuid(bubble_id: str) -> str:
     NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
     return str(uuid.uuid5(NAMESPACE, bubble_id))
@@ -102,25 +99,37 @@ def get_zhipu_embedding(text: str) -> List[float]:
 # ================= 4. 启动事件 =================
 @app.on_event("startup")
 def startup_event():
-    """启动时检查并创建智谱的老师向量表"""
+    """启动时检查并自动创建所需的两张表"""
+    if not qdrant:
+        return
+
     try:
-        if qdrant and not qdrant.collection_exists(COLLECTION_NAME_ZHIPU):
-            print(f"正在创建集合: {COLLECTION_NAME_ZHIPU} ...")
+        # 1. 检查并创建雅思老师表 (OpenAI, 1536维度)
+        if not qdrant.collection_exists(COLLECTION_NAME_IELTS):
+            print(f"正在创建雅思新表: {COLLECTION_NAME_IELTS} ...")
+            qdrant.recreate_collection(
+                collection_name=COLLECTION_NAME_IELTS,
+                vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
+            )
+            qdrant.create_payload_index(COLLECTION_NAME_IELTS, "bubble_id", models.PayloadSchemaType.KEYWORD)
+            print(f"✅ {COLLECTION_NAME_IELTS} 初始化完成！")
+
+        # 2. 检查并创建智谱老师表 (GLM, 1024维度)
+        if not qdrant.collection_exists(COLLECTION_NAME_ZHIPU):
+            print(f"正在创建智谱新表: {COLLECTION_NAME_ZHIPU} ...")
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_ZHIPU,
                 vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
             )
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "price", models.PayloadSchemaType.INTEGER)
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "bubble_id", models.PayloadSchemaType.KEYWORD)
-            print("✅ 数据库初始化完成！")
-        else:
-            print("✅ 数据库已存在，准备就绪。")
+            print(f"✅ {COLLECTION_NAME_ZHIPU} 初始化完成！")
+
     except Exception as e:
-        print(f"初始化警告 (可忽略): {e}")
+        print(f"初始化数据库表失败: {e}")
 
 # ================= 5. 核心接口 =================
 
-# 🎯 接口 1: 雅思语音评测 (OpenAI)
 @app.post("/assess-audio")
 async def assess_audio(file: Union[UploadFile, str] = File(...), question_text: str = Form(...)):
     temp_filename = f"temp_{uuid.uuid4()}.webm"
@@ -144,7 +153,6 @@ async def assess_audio(file: Union[UploadFile, str] = File(...), question_text: 
 
         ai_result = analyze_audio_transcript(transcript_text, question_text)
         
-        # 搜索老师 (使用 OpenAI 向量搜索旧表)
         recommended_teachers = []
         if qdrant:
             try:
@@ -180,7 +188,6 @@ async def assess_audio(file: Union[UploadFile, str] = File(...), question_text: 
     finally:
         if os.path.exists(temp_filename): os.remove(temp_filename)
 
-# 🎯 接口 2: 同步外教数据 (智谱AI)
 @app.post("/sync_tutor")
 def sync_tutor(tutor: TutorSyncRequest):
     try:
@@ -204,24 +211,29 @@ def sync_tutor(tutor: TutorSyncRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 🎯 接口 3: 智能匹配老师 (智谱AI)
 @app.post("/recommend")
 def recommend(req: MatchRequest):
     try:
         query_text = f"寻找老师，需求：{' '.join(req.user_tags)}"
         query_vector = get_zhipu_embedding(query_text)
         
-        search_url = f"{QDRANT_URL}/collections/{COLLECTION_NAME_ZHIPU}/points/search"
-        search_payload = {
-            "vector": query_vector, "limit": 3, "with_payload": True,
-            "filter": {"must": [{"key": "price", "range": {"lte": int(req.max_price)}}]}
-        }
-        res = requests.post(search_url, headers={"api-key": QDRANT_API_KEY_ZHIPU}, json=search_payload)
-        search_result = res.json().get("result", [])
+        search_result = qdrant.search(
+            collection_name=COLLECTION_NAME_ZHIPU,
+            query_vector=query_vector,
+            query_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="price",
+                        range=models.Range(lte=int(req.max_price))
+                    )
+                ]
+            ),
+            limit=3
+        )
         
         if not search_result: return []
 
-        context_list = [f"- ID: {hit['payload']['bubble_id']}, 姓名: {hit['payload']['name']}, 资料: {hit['payload']['full_info']}" for hit in search_result]
+        context_list = [f"- ID: {hit.payload['bubble_id']}, 姓名: {hit.payload['name']}, 资料: {hit.payload['full_info']}" for hit in search_result]
         
         prompt = f"""你是一个课程顾问。请根据用户需求和以下候选人资料，推荐这几位老师。
         用户需求：{req.user_tags} \n候选人列表：\n{chr(10).join(context_list)}
