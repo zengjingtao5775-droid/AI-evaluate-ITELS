@@ -245,6 +245,42 @@ def recommend(req: MatchRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+# ================= 6. 强制建表专属通道 =================
+@app.get("/init-db")
+def init_database():
+    """在浏览器访问这个地址，强制初始化两张表"""
+    if not qdrant:
+        return {"error": "Qdrant 客户端未连接，请检查 Render 环境变量的 URL 和 API Key"}
+    
+    results = []
+    try:
+        # 1. 建雅思表 (1536维度)
+        if not qdrant.collection_exists(COLLECTION_NAME_IELTS):
+            qdrant.recreate_collection(
+                collection_name=COLLECTION_NAME_IELTS,
+                vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
+            )
+            qdrant.create_payload_index(COLLECTION_NAME_IELTS, "bubble_id", models.PayloadSchemaType.KEYWORD)
+            results.append(f"✅ 雅思表 {COLLECTION_NAME_IELTS} 创建成功！")
+        else:
+            results.append(f"⚡ 雅思表 {COLLECTION_NAME_IELTS} 已经存在了。")
+
+        # 2. 建智谱老师表 (1024维度)
+        if not qdrant.collection_exists(COLLECTION_NAME_ZHIPU):
+            qdrant.recreate_collection(
+                collection_name=COLLECTION_NAME_ZHIPU,
+                vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
+            )
+            qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "price", models.PayloadSchemaType.INTEGER)
+            qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "bubble_id", models.PayloadSchemaType.KEYWORD)
+            results.append(f"✅ 智谱表 {COLLECTION_NAME_ZHIPU} 创建成功！")
+        else:
+            results.append(f"⚡ 智谱表 {COLLECTION_NAME_ZHIPU} 已经存在了。")
+
+        return {"status": "success", "details": results}
+
+    except Exception as e:
+        return {"status": "error", "message": f"建表失败: {str(e)}"}
 
 if __name__ == "__main__":
     import uvicorn
