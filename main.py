@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import shutil
 import tempfile
@@ -6,7 +7,7 @@ import uuid
 import urllib.request
 from typing import List, Union
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -17,6 +18,7 @@ from zhipuai import ZhipuAI
 # ================= 1. 配置与初始化 =================
 load_dotenv()
 
+# 从 Render 环境变量读取 Qdrant 链接
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
@@ -92,16 +94,45 @@ def get_zhipu_embedding(text: str) -> List[float]:
     response = zhipu_client.embeddings.create(model="embedding-2", input=text)
     return response.data[0].embedding
 
-# ================= 4. 启动事件 (保留作为双重保险) =================
+def background_qdrant_sync(tutor: TutorSyncRequest):
+    """异步后台同步数据到 Qdrant，不堵塞前端"""
+    if not qdrant:
+        print("❌ Qdrant 未连接，无法后台同步")
+        return
+    try:
+        print(f"⏳ 开始后台同步老师 {tutor.name} 的数据到 Qdrant...")
+        text_to_embed = f"{tutor.name}。擅长：{' '.join(tutor.tags)}。简介：{tutor.description}"
+        vector = get_zhipu_embedding(text_to_embed)
+        
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME_ZHIPU,
+            points=[
+                models.PointStruct(
+                    id=get_deterministic_uuid(tutor.bubble_id),
+                    vector=vector,
+                    payload={
+                        "bubble_id": tutor.bubble_id, "name": tutor.name,
+                        "price": int(tutor.price), "tags": tutor.tags, "full_info": text_to_embed
+                    }
+                )
+            ]
+        )
+        print(f"✅ 老师 {tutor.name} 后台同步 Qdrant 成功！")
+    except Exception as e:
+        print(f"❌ 后台同步失败: {str(e)}")
+
+
+# ================= 4. 启动事件 =================
 @app.on_event("startup")
 def startup_event():
-    """尝试在启动时建表"""
+    """启动时检查并自动创建所需的两张表"""
     if not qdrant:
         return
     try:
         existing_collections = [c.name for c in qdrant.get_collections().collections]
 
         if COLLECTION_NAME_IELTS not in existing_collections:
+            print(f"正在创建雅思新表: {COLLECTION_NAME_IELTS} ...")
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_IELTS,
                 vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
@@ -109,6 +140,7 @@ def startup_event():
             qdrant.create_payload_index(COLLECTION_NAME_IELTS, "bubble_id", models.PayloadSchemaType.KEYWORD)
 
         if COLLECTION_NAME_ZHIPU not in existing_collections:
+            print(f"正在创建智谱新表: {COLLECTION_NAME_ZHIPU} ...")
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_ZHIPU,
                 vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
@@ -180,25 +212,11 @@ async def assess_audio(file: Union[UploadFile, str] = File(...), question_text: 
         if os.path.exists(temp_filename): os.remove(temp_filename)
 
 @app.post("/sync_tutor")
-def sync_tutor(tutor: TutorSyncRequest):
+def sync_tutor(tutor: TutorSyncRequest, background_tasks: BackgroundTasks):
+    """瞬间返回成功给 Bubble，将真正的同步任务丢给后台"""
     try:
-        text_to_embed = f"{tutor.name}。擅长：{' '.join(tutor.tags)}。简介：{tutor.description}"
-        vector = get_zhipu_embedding(text_to_embed)
-        
-        qdrant.upsert(
-            collection_name=COLLECTION_NAME_ZHIPU,
-            points=[
-                models.PointStruct(
-                    id=get_deterministic_uuid(tutor.bubble_id),
-                    vector=vector,
-                    payload={
-                        "bubble_id": tutor.bubble_id, "name": tutor.name,
-                        "price": int(tutor.price), "tags": tutor.tags, "full_info": text_to_embed
-                    }
-                )
-            ]
-        )
-        return {"status": "success", "msg": f"老师 {tutor.name} 已同步"}
+        background_tasks.add_task(background_qdrant_sync, tutor)
+        return {"status": "success", "msg": f"老师 {tutor.name} 的数据已接收，正在后台处理中"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -231,8 +249,16 @@ def recommend(req: MatchRequest):
         请务必只返回一个纯JSON数组：[{{"bubble_id": "...", "reason": "30字以内的推荐理由"}}]"""
 
         response = zhipu_client.chat.completions.create(model="glm-4-flash", messages=[{"role": "user", "content": prompt}], temperature=0.7)
-        content = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
-        return json.loads(content)
+        content = response.choices[0].message.content
+        
+        # 🌟 核心修复：使用正则表达式抠出纯正 JSON 数据，防止大模型废话报错 🌟
+        match = re.search(r'\[.*\]', content, re.DOTALL)
+        if match:
+            clean_json_str = match.group(0)
+            return json.loads(clean_json_str)
+        else:
+            print(f"⚠️ 无法从 AI 回复中提取 JSON。AI 原始回复: {content}")
+            return []
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
