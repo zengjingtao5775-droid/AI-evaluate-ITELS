@@ -18,7 +18,6 @@ from zhipuai import ZhipuAI
 # ================= 1. 配置与初始化 =================
 load_dotenv()
 
-# 从 Render 环境变量读取 Qdrant 链接
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
@@ -58,7 +57,8 @@ class TutorSyncRequest(BaseModel):
 
 class MatchRequest(BaseModel):
     user_tags: List[str]
-    max_price: float
+    # 🌟 修复 422 错误：允许前端传空字符串，或者不传
+    max_price: Union[float, str, None] = 9999.0
 
 # ================= 3. 辅助函数 =================
 def get_openai_embedding(text: str):
@@ -95,15 +95,12 @@ def get_zhipu_embedding(text: str) -> List[float]:
     return response.data[0].embedding
 
 def background_qdrant_sync(tutor: TutorSyncRequest):
-    """异步后台同步数据到 Qdrant，不堵塞前端"""
+    """异步后台同步数据到 Qdrant"""
     if not qdrant:
-        print("❌ Qdrant 未连接，无法后台同步")
         return
     try:
-        print(f"⏳ 开始后台同步老师 {tutor.name} 的数据到 Qdrant...")
         text_to_embed = f"{tutor.name}。擅长：{' '.join(tutor.tags)}。简介：{tutor.description}"
         vector = get_zhipu_embedding(text_to_embed)
-        
         qdrant.upsert(
             collection_name=COLLECTION_NAME_ZHIPU,
             points=[
@@ -121,33 +118,20 @@ def background_qdrant_sync(tutor: TutorSyncRequest):
     except Exception as e:
         print(f"❌ 后台同步失败: {str(e)}")
 
-
 # ================= 4. 启动事件 =================
 @app.on_event("startup")
 def startup_event():
-    """启动时检查并自动创建所需的两张表"""
-    if not qdrant:
-        return
+    if not qdrant: return
     try:
         existing_collections = [c.name for c in qdrant.get_collections().collections]
-
         if COLLECTION_NAME_IELTS not in existing_collections:
-            print(f"正在创建雅思新表: {COLLECTION_NAME_IELTS} ...")
-            qdrant.recreate_collection(
-                collection_name=COLLECTION_NAME_IELTS,
-                vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
-            )
+            qdrant.recreate_collection(collection_name=COLLECTION_NAME_IELTS, vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE))
             qdrant.create_payload_index(COLLECTION_NAME_IELTS, "bubble_id", models.PayloadSchemaType.KEYWORD)
 
         if COLLECTION_NAME_ZHIPU not in existing_collections:
-            print(f"正在创建智谱新表: {COLLECTION_NAME_ZHIPU} ...")
-            qdrant.recreate_collection(
-                collection_name=COLLECTION_NAME_ZHIPU,
-                vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
-            )
+            qdrant.recreate_collection(collection_name=COLLECTION_NAME_ZHIPU, vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE))
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "price", models.PayloadSchemaType.INTEGER)
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "bubble_id", models.PayloadSchemaType.KEYWORD)
-
     except Exception as e:
         print(f"初始化数据库表失败: {e}")
 
@@ -181,30 +165,17 @@ async def assess_audio(file: Union[UploadFile, str] = File(...), question_text: 
             try:
                 search_query = ai_result.get('weakness_search_query', 'IELTS speaking teacher')
                 query_vector = get_openai_embedding(search_query)
-                search_result = qdrant.search(
-                    collection_name=COLLECTION_NAME_IELTS,
-                    query_vector=query_vector,
-                    limit=3
-                )
+                search_result = qdrant.search(collection_name=COLLECTION_NAME_IELTS, query_vector=query_vector, limit=3)
                 for hit in search_result:
                     payload = hit.payload or {}
-                    recommended_teachers.append({
-                        "bubble_id": payload.get('bubble_id'),
-                        "name": payload.get('name'),
-                        "match_score": hit.score,
-                        "specialty": payload.get('specialty')
-                    })
+                    recommended_teachers.append({"bubble_id": payload.get('bubble_id'), "name": payload.get('name'), "match_score": hit.score, "specialty": payload.get('specialty')})
             except Exception as e:
                 print(f"⚠️ Search warning: {e}")
 
         return {
-            "status": "success",
-            "transcript": transcript_text,
-            "overall_score": ai_result.get('overall_score'),
-            "short_evaluation": ai_result.get('short_evaluation'),
-            "detailed_feedback": ai_result.get('detailed_feedback'),
-            "improvement_suggestions": ai_result.get('improvement_suggestions'),
-            "recommendations": recommended_teachers
+            "status": "success", "transcript": transcript_text, "overall_score": ai_result.get('overall_score'),
+            "short_evaluation": ai_result.get('short_evaluation'), "detailed_feedback": ai_result.get('detailed_feedback'),
+            "improvement_suggestions": ai_result.get('improvement_suggestions'), "recommendations": recommended_teachers
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
@@ -213,7 +184,6 @@ async def assess_audio(file: Union[UploadFile, str] = File(...), question_text: 
 
 @app.post("/sync_tutor")
 def sync_tutor(tutor: TutorSyncRequest, background_tasks: BackgroundTasks):
-    """瞬间返回成功给 Bubble，将真正的同步任务丢给后台"""
     try:
         background_tasks.add_task(background_qdrant_sync, tutor)
         return {"status": "success", "msg": f"老师 {tutor.name} 的数据已接收，正在后台处理中"}
@@ -223,6 +193,12 @@ def sync_tutor(tutor: TutorSyncRequest, background_tasks: BackgroundTasks):
 @app.post("/recommend")
 def recommend(req: MatchRequest):
     try:
+        # 🌟 安全处理前端传来的价格：如果有填且是数字就用，没填或填错就默认 9999 块
+        try:
+            price_limit = float(req.max_price) if req.max_price else 9999.0
+        except ValueError:
+            price_limit = 9999.0
+
         query_text = f"寻找老师，需求：{' '.join(req.user_tags)}"
         query_vector = get_zhipu_embedding(query_text)
         
@@ -230,12 +206,7 @@ def recommend(req: MatchRequest):
             collection_name=COLLECTION_NAME_ZHIPU,
             query_vector=query_vector,
             query_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="price",
-                        range=models.Range(lte=int(req.max_price))
-                    )
-                ]
+                must=[models.FieldCondition(key="price", range=models.Range(lte=int(price_limit)))]
             ),
             limit=3
         )
@@ -246,57 +217,48 @@ def recommend(req: MatchRequest):
         
         prompt = f"""你是一个课程顾问。请根据用户需求和以下候选人资料，推荐这几位老师。
         用户需求：{req.user_tags} \n候选人列表：\n{chr(10).join(context_list)}
-        请务必只返回一个纯JSON数组：[{{"bubble_id": "...", "reason": "30字以内的推荐理由"}}]"""
+        
+        请务必严格按照以下JSON对象格式返回，绝对不要有任何多余的汉字或Markdown标记：
+        {{
+            "recommendations": [
+                {{"bubble_id": "...", "reason": "30字以内的推荐理由"}}
+            ]
+        }}"""
 
         response = zhipu_client.chat.completions.create(model="glm-4-flash", messages=[{"role": "user", "content": prompt}], temperature=0.7)
         content = response.choices[0].message.content
         
-        # 🌟 核心修复：使用正则表达式抠出纯正 JSON 数据，防止大模型废话报错 🌟
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        if match:
-            clean_json_str = match.group(0)
-            return json.loads(clean_json_str)
+        # 🌟 终极废话过滤器：寻找包含对象的首尾大括号，100% 避免多余符号引起的崩溃 🌟
+        start = content.find('{')
+        end = content.rfind('}')
+        if start != -1 and end != -1:
+            clean_json_str = content[start:end+1]
+            data = json.loads(clean_json_str)
+            return data.get("recommendations", [])
         else:
-            print(f"⚠️ 无法从 AI 回复中提取 JSON。AI 原始回复: {content}")
+            print(f"⚠️ 无法提取 JSON。原始回复: {content}")
             return []
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ================= 6. 强制建表专属通道 =================
 @app.get("/init-db")
 def init_database():
-    """在浏览器访问这个地址，强制初始化两张表"""
-    if not qdrant:
-        return {"error": "Qdrant 客户端未连接，请检查环境变量"}
-    
+    if not qdrant: return {"error": "Qdrant 客户端未连接，请检查环境变量"}
     results = []
     try:
         existing_collections = [c.name for c in qdrant.get_collections().collections]
-
         if COLLECTION_NAME_IELTS not in existing_collections:
-            qdrant.recreate_collection(
-                collection_name=COLLECTION_NAME_IELTS,
-                vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
-            )
+            qdrant.recreate_collection(collection_name=COLLECTION_NAME_IELTS, vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE))
             qdrant.create_payload_index(COLLECTION_NAME_IELTS, "bubble_id", models.PayloadSchemaType.KEYWORD)
             results.append(f"✅ 雅思表 {COLLECTION_NAME_IELTS} 创建成功！")
-        else:
-            results.append(f"⚡ 雅思表 {COLLECTION_NAME_IELTS} 已经存在了。")
-
+        
         if COLLECTION_NAME_ZHIPU not in existing_collections:
-            qdrant.recreate_collection(
-                collection_name=COLLECTION_NAME_ZHIPU,
-                vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
-            )
+            qdrant.recreate_collection(collection_name=COLLECTION_NAME_ZHIPU, vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE))
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "price", models.PayloadSchemaType.INTEGER)
             qdrant.create_payload_index(COLLECTION_NAME_ZHIPU, "bubble_id", models.PayloadSchemaType.KEYWORD)
             results.append(f"✅ 智谱表 {COLLECTION_NAME_ZHIPU} 创建成功！")
-        else:
-            results.append(f"⚡ 智谱表 {COLLECTION_NAME_ZHIPU} 已经存在了。")
-
         return {"status": "success", "details": results}
-
     except Exception as e:
         return {"status": "error", "message": f"建表失败: {str(e)}"}
 
