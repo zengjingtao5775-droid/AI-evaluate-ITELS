@@ -92,18 +92,16 @@ def get_zhipu_embedding(text: str) -> List[float]:
     response = zhipu_client.embeddings.create(model="embedding-2", input=text)
     return response.data[0].embedding
 
-# ================= 4. 启动事件 (已修复兼容性) =================
+# ================= 4. 启动事件 (保留作为双重保险) =================
 @app.on_event("startup")
 def startup_event():
-    """启动时检查并自动创建所需的两张表（兼容所有 Qdrant 版本）"""
+    """尝试在启动时建表"""
     if not qdrant:
         return
     try:
-        # 获取现有的所有表名
         existing_collections = [c.name for c in qdrant.get_collections().collections]
 
         if COLLECTION_NAME_IELTS not in existing_collections:
-            print(f"正在创建雅思新表: {COLLECTION_NAME_IELTS} ...")
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_IELTS,
                 vectors_config=models.VectorParams(size=1536, distance=models.Distance.COSINE),
@@ -111,7 +109,6 @@ def startup_event():
             qdrant.create_payload_index(COLLECTION_NAME_IELTS, "bubble_id", models.PayloadSchemaType.KEYWORD)
 
         if COLLECTION_NAME_ZHIPU not in existing_collections:
-            print(f"正在创建智谱新表: {COLLECTION_NAME_ZHIPU} ...")
             qdrant.recreate_collection(
                 collection_name=COLLECTION_NAME_ZHIPU,
                 vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
@@ -240,7 +237,7 @@ def recommend(req: MatchRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ================= 6. 强制建表专属通道 (已修复兼容性) =================
+# ================= 6. 强制建表专属通道 =================
 @app.get("/init-db")
 def init_database():
     """在浏览器访问这个地址，强制初始化两张表"""
